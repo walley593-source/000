@@ -69,8 +69,6 @@ state = {
     #         -> WITHDRAW_SUBMITTED -> ARMED (+ resume)
     "withdraw_state": "ARMED",
     "last_withdrawal": None,   # {"amount","tx","time"} of the most recent withdrawal
-    "withdraw_flat_since": None,     # when the account went flat, so the sell can settle
-    "withdraw_locked_market": None,  # after a withdrawal, wait for the NEXT market
     # After a take-profit / stop-loss close, lock this market id so we don't re-enter
     # until the next 15m window starts.
     "tp_sl_locked_market": None,
@@ -456,51 +454,6 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
     return new_side  # signal to the loop that a flip happened this tick
 
 
-async def close_open_position(poly_snapshot: Dict[str, Any], reason: str):
-    """Sell the open position at the current bid and book the realized P/L. Used by
-    take-profit / stop-loss and by the auto-withdrawal (to go flat before extracting
-    funds). Returns {"side","exit_price","pl"} on success, else None."""
-    if not state["active_trades"] or not poly_snapshot.get("ok"):
-        return None
-    trade = state["active_trades"][0]
-    market = poly_snapshot["market"]
-    if str(trade.get("market_id")) != str(market.get("id")):
-        return None  # position is in a prior market — let it settle on its own
-
-    prices = poly_snapshot["prices"]
-    orderbook = poly_snapshot.get("orderbook", {})
-    token_ids = poly_snapshot.get("token_ids", {})
-    held_key = "up" if trade["side"] == "UP" else "down"
-    ob = orderbook.get(held_key) or {}
-    exit_price = ob.get("bestBid") or prices.get(held_key)
-    if not exit_price or exit_price <= 0:
-        return None
-
-    if state["trading_mode"] == "live":
-        token_id = token_ids.get(held_key)
-        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
-        if not result.get("ok"):
-            log_message(f"{reason} sell FAILED ({trade['side']}): {result.get('error')}")
-            return None
-    else:
-        state["paper_balance"] += trade["shares"] * exit_price
-
-    pl = (trade["shares"] * exit_price) - trade["amount"]
-    side = trade["side"]
-    trade["status"] = "CLOSED"
-    trade["exit_time"] = datetime.now().isoformat()
-    trade["exit_reason"] = reason
-    trade["settlement_price_at_expiry"] = exit_price
-    trade["profit_loss"] = pl
-    trade["open_price"] = trade.get("strike_price")
-    trade["exit_mark"] = exit_price
-    state["trade_history"].append(trade)
-    state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
-    state["last_trade_side"] = None
-    save_state()
-    return {"side": side, "exit_price": exit_price, "pl": pl}
-
-
 async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
     """Take-profit / stop-loss early exit. Closes the open position when its unrealized
     P/L (marked at the current bid) reaches +TAKE_PROFIT_PCT or -STOP_LOSS_PCT of the
@@ -518,6 +471,7 @@ async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
 
     prices = poly_snapshot["prices"]
     orderbook = poly_snapshot.get("orderbook", {})
+    token_ids = poly_snapshot.get("token_ids", {})
     held_key = "up" if trade["side"] == "UP" else "down"
     ob = orderbook.get(held_key) or {}
     exit_price = ob.get("bestBid") or prices.get(held_key)   # what we'd get selling now
@@ -536,15 +490,31 @@ async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
     if not hit:
         return None
 
-    res = await close_open_position(poly_snapshot, hit)
-    if not res:
-        return None
+    # Close the position at the bid.
+    if state["trading_mode"] == "live":
+        token_id = token_ids.get(held_key)
+        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
+        if not result.get("ok"):
+            log_message(f"{hit.upper()} sell FAILED ({trade['side']}): {result.get('error')}")
+            return None
+    else:
+        state["paper_balance"] += trade["shares"] * exit_price
+
+    trade["status"] = "CLOSED"
+    trade["exit_time"] = datetime.now().isoformat()
+    trade["exit_reason"] = hit
+    trade["settlement_price_at_expiry"] = exit_price
+    trade["profit_loss"] = unreal
+    trade["open_price"] = trade.get("strike_price")
+    trade["exit_mark"] = exit_price
+    state["trade_history"].append(trade)
+    state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
+    state["last_trade_side"] = None
     # Lock this market so no re-entry until the next 15m window.
     state["tp_sl_locked_market"] = str(market.get("id"))
     save_state()
     label = "TAKE PROFIT" if hit == "take_profit" else "STOP LOSS"
-    log_message(f"{label}: closed {res['side']} @ {res['exit_price']:.2f} "
-                f"(P/L ${res['pl']:.2f}, {pl_pct:+.1f}%); locked market until next window")
+    log_message(f"{label}: closed {trade['side']} @ {exit_price:.2f} (P/L ${unreal:.2f}, {pl_pct:+.1f}%); locked market until next window")
     return hit
 
 
@@ -706,56 +676,33 @@ async def update_trades(current_prices: Dict[str, Any]):
     if trades_changed:
         save_state()
 
-async def maybe_auto_withdraw(equity: Optional[float], poly_snapshot: Dict[str, Any]):
+async def maybe_auto_withdraw():
     """Auto-withdrawal (capital extractor) state machine — LIVE mode only.
 
-        ARMED --(EQUITY >= trigger)--> WAITING_FLAT --(close any open trade, go flat)-->
-        WITHDRAWING --(submitted)--> WITHDRAW_SUBMITTED --> ARMED
+        ARMED --(balance >= trigger)--> WAITING_FLAT --(no open trades)--> WITHDRAWING
+              --(withdrawal submitted)--> WITHDRAW_SUBMITTED --> ARMED (+ auto-resume)
 
-    The trigger uses **equity** (cash + the value of any open position), so a running
-    trade still counts toward the threshold. If a trade is open when the trigger fires,
-    it is CLOSED IMMEDIATELY (sold at the bid) so the balance settles into cash.
-
-    After the withdrawal:
-      - auto_resume ON  -> trading resumes at the NEXT 15m market (this one is locked).
-      - auto_resume OFF -> the bot is STOPPED entirely.
-    """
+    While the state is not ARMED, new entries/flips are paused (see update_loop) so
+    the account can settle flat before funds are extracted. Withdraws WITHDRAW_AMOUNT
+    of pUSD to your own wallet — the EOA derived from the key/seed (gasless)."""
     if state["trading_mode"] != "live" or not settings.AUTO_WITHDRAW_ENABLED:
         if state["withdraw_state"] != "ARMED":   # disabled → never keep entries paused
             state["withdraw_state"] = "ARMED"
         return
 
     st = state["withdraw_state"]
-    cash = state["paper_balance"]  # live pUSD balance is mirrored here
+    bal = state["paper_balance"]  # live pUSD balance is mirrored here
 
     if st == "ARMED":
-        # Trigger on EQUITY, not just cash — so an open trade counts toward it.
-        if equity is not None and equity >= settings.WITHDRAW_TRIGGER_BALANCE:
+        if bal is not None and bal >= settings.WITHDRAW_TRIGGER_BALANCE:
             state["withdraw_state"] = "WAITING_FLAT"
-            state["withdraw_flat_since"] = None
-            log_message(f"Auto-withdraw: equity ${equity:.2f} >= ${settings.WITHDRAW_TRIGGER_BALANCE:.2f} "
-                        f"→ pausing entries and closing any open trade")
+            log_message(f"Auto-withdraw: balance ${bal:.2f} >= ${settings.WITHDRAW_TRIGGER_BALANCE:.2f} → pausing entries, waiting to go flat")
 
     elif st == "WAITING_FLAT":
-        # Close the open position immediately so the funds settle into cash.
-        if state["active_trades"]:
-            res = await close_open_position(poly_snapshot, "withdraw_close")
-            if res:
-                log_message(f"Auto-withdraw: closed {res['side']} @ {res['exit_price']:.2f} "
-                            f"(P/L ${res['pl']:.2f}) to go flat")
-                state["withdraw_flat_since"] = time.time()
-                state["last_balance_refresh"] = 0   # re-read the on-chain balance next tick
-            return
-        # Flat — give the sell a moment to settle on-chain before reading the balance.
-        if state.get("withdraw_flat_since") is None:
-            state["withdraw_flat_since"] = time.time()
-            state["last_balance_refresh"] = 0
-            return
-        if time.time() - state["withdraw_flat_since"] < 5:
-            return
-        state["withdraw_flat_since"] = None
-        state["withdraw_state"] = "WITHDRAWING"
-        log_message("Auto-withdraw: account is flat → withdrawing")
+        # FOK market orders never rest, so "flat" == no open positions.
+        if not state["active_trades"]:
+            state["withdraw_state"] = "WITHDRAWING"
+            log_message("Auto-withdraw: account is flat → withdrawing")
 
     elif st == "WITHDRAWING":
         # Destination: the user-set address, or fall back to your own wallet (the EOA
@@ -765,9 +712,8 @@ async def maybe_auto_withdraw(equity: Optional[float], poly_snapshot: Dict[str, 
             log_message("Auto-withdraw aborted: no wallet/key available. Disarming.")
             state["withdraw_state"] = "ARMED"
             return
-        amount = min(float(settings.WITHDRAW_AMOUNT), float(cash or 0))
+        amount = min(float(settings.WITHDRAW_AMOUNT), float(bal or 0))
         if amount <= 0:
-            log_message("Auto-withdraw aborted: no cash balance to withdraw. Disarming.")
             state["withdraw_state"] = "ARMED"
             return
         result = await asyncio.to_thread(clob_trader.withdraw_pusd, recipient, amount)
@@ -781,16 +727,14 @@ async def maybe_auto_withdraw(equity: Optional[float], poly_snapshot: Dict[str, 
             state["withdraw_state"] = "ARMED"
 
     elif st == "WITHDRAW_SUBMITTED":
-        state["last_balance_refresh"] = 0  # fresh balance read so we don't re-trigger on a stale value
+        # resume_after 'submitted' (default) — transfer_pusd already waited for a
+        # receipt, so treat it as good and resume immediately.
+        state["last_balance_refresh"] = 0  # force a fresh balance read so we don't re-trigger on a stale value
         if not settings.WITHDRAW_AUTO_RESUME:
             state["running"] = False
-            log_message("Auto-withdraw complete; auto-resume OFF → bot STOPPED.")
+            log_message("Auto-withdraw complete; auto-resume OFF → bot stopped.")
         else:
-            # Resume, but not in the market we just exited — wait for the next 15m one.
-            mkt_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
-            if mkt_id:
-                state["withdraw_locked_market"] = mkt_id
-            log_message("Auto-withdraw complete; trading resumes at the next 15m market.")
+            log_message("Auto-withdraw complete; trading resumed.")
         state["withdraw_state"] = "ARMED"
 
 
@@ -962,26 +906,22 @@ async def update_loop():
             flip_side = None
             tp_sl_hit = None
 
-            # Clear the market locks (take-profit/stop-loss and post-withdrawal) once the
-            # window has rolled to a new market, so the next 15m window can trade again.
+            # Clear the take-profit/stop-loss market lock once the window has rolled to
+            # a new market (so the next 15m window can trade again).
             cur_market_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
             if state.get("tp_sl_locked_market") and cur_market_id and state["tp_sl_locked_market"] != cur_market_id:
                 state["tp_sl_locked_market"] = None
-            if state.get("withdraw_locked_market") and cur_market_id and state["withdraw_locked_market"] != cur_market_id:
-                state["withdraw_locked_market"] = None
 
             # Take-profit / stop-loss runs first (even mid-withdrawal we still want to
             # honour an exit), and closing locks the market against re-entry this window.
             if poly_snapshot["ok"] and state["running"]:
                 tp_sl_hit = await maybe_tp_sl(poly_snapshot)
 
-            # Entries/flips run only when STARTED, no withdrawal pending, this market is
-            # not locked (by TP/SL or by a just-completed withdrawal), and TP/SL didn't
-            # just fire this tick.
+            # Entries/flips run only when STARTED, no withdrawal pending, this market
+            # isn't TP/SL-locked, and TP/SL didn't just fire this tick.
             tp_sl_locked = state.get("tp_sl_locked_market") is not None and state["tp_sl_locked_market"] == cur_market_id
-            withdraw_locked = state.get("withdraw_locked_market") is not None and state["withdraw_locked_market"] == cur_market_id
             entries_allowed = (state["running"] and state["withdraw_state"] == "ARMED"
-                               and not tp_sl_locked and not withdraw_locked and not tp_sl_hit)
+                               and not tp_sl_locked and not tp_sl_hit)
             if poly_snapshot["ok"] and entries_allowed:
                 flip_side = await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
                 exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
@@ -991,8 +931,6 @@ async def update_loop():
                 exec_result = tp_sl_hit
             elif tp_sl_locked:
                 exec_result = "tp_sl_locked"
-            elif withdraw_locked:
-                exec_result = "withdraw_locked"
 
             await update_trades(current_prices_dict)
 
@@ -1043,11 +981,8 @@ async def update_loop():
                     if real_bal is not None:
                         state["paper_balance"] = real_bal
                     state["last_balance_refresh"] = now_ts
-                    equity = state["paper_balance"] + open_value  # keep equity in step with the fresh balance
-                # Auto-withdrawal (capital extractor) — triggers on EQUITY (cash + open
-                # position value), force-closes any open trade, withdraws, then resumes
-                # at the next market (or stops the bot if auto-resume is off).
-                await maybe_auto_withdraw(equity, poly_snapshot)
+                # Auto-withdrawal (capital extractor) — pause/flat/withdraw/resume.
+                await maybe_auto_withdraw()
 
             # A flip opens a position independently of the EV signal — surface it so
             # a flip tick never reads as a bare "NO TRADE".
